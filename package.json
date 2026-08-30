@@ -1,0 +1,14 @@
+{
+  "name": "claw-gh-install",
+  "version": "2026.08.30_01",
+  "description": "Install OpenClaw plugins and skills from GitHub repositories via tmp clones.",
+  "keywords": ["pi-package", "openclaw", "installer", "android", "termux"],
+  "license": "MIT",
+  "pi": {
+    "skills": ["./"]
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/woodmanlegion/claw-gh-install"
+  }
+}

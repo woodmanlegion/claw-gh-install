@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""
+claw-gh-install — Install OpenClaw plugins and skills from GitHub.
+
+Clones repos to ~/.openclaw/workspace/claw-gh/tmp/<repo-name>/ and installs
+via openclaw plugins install or openclaw skills install. Symlinks user-facing
+binaries to ~/.openclaw/workspace/bin/ for PATH access.
+
+Usage:
+  claw-gh-install <owner/repo>           Clone and install
+  claw-gh-install --update <repo-name>   git pull + reinstall
+  claw-gh-install --list                 List installed repos
+  claw-gh-install --remove <repo-name>   Remove install + tmp clone
+  claw-gh-install --show-config          Show paths and registry
+  claw-gh-install --help                 Show this help
+"""
+
+import sys, os, json, subprocess, shutil
+from pathlib import Path
+from datetime import datetime, timezone
+
+HOME         = os.environ.get('HOME', '/data/data/com.termux/files/home')
+OPENCLAW     = f"{HOME}/.openclaw"
+CGI_DIR      = f"{OPENCLAW}/workspace/claw-gh"
+TMP_DIR      = f"{CGI_DIR}/tmp"
+REGISTRY     = f"{CGI_DIR}/installed.json"
+WORKSPACE_BIN = f"{OPENCLAW}/workspace/bin"
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _ensure_dirs():
+    for d in (TMP_DIR, WORKSPACE_BIN):
+        os.makedirs(d, exist_ok=True)
+
+def _load_registry():
+    try:
+        return json.loads(Path(REGISTRY).read_text())
+    except Exception:
+        return {}
+
+def _save_registry(reg):
+    os.makedirs(CGI_DIR, exist_ok=True)
+    Path(REGISTRY).write_text(json.dumps(reg, indent=2))
+
+def _run(cmd, **kwargs):
+    return subprocess.run(cmd, check=True, **kwargs)
+
+def _now():
+    return datetime.now(timezone.utc).isoformat()
+
+def _log(msg):
+    print(f"[claw-gh-install] {msg}")
+
+def _err(msg):
+    print(f"[claw-gh-install] ERROR: {msg}", file=sys.stderr)
+
+
+# ── Type detection ────────────────────────────────────────────────────────────
+
+def _detect_type(clone_path):
+    """Return ('plugin', install_path) or ('skill', install_path) or (None, None)."""
+    if os.path.exists(f"{clone_path}/plugin/openclaw.plugin.json"):
+        return 'plugin', f"{clone_path}/plugin"
+    if os.path.exists(f"{clone_path}/openclaw.plugin.json"):
+        return 'plugin', clone_path
+    if os.path.exists(f"{clone_path}/SKILL.md"):
+        return 'skill', clone_path
+    return None, None
+
+
+# ── Install ───────────────────────────────────────────────────────────────────
+
+def _openclaw_install(install_type, install_path):
+    if install_type == 'plugin':
+        _run(['openclaw', 'plugins', 'install', '--force', install_path])
+    else:
+        _run(['openclaw', 'skills', 'install', install_path])
+
+def _symlink_bins(clone_path, install_type):
+    """Symlink executables from the tmp clone's bin/ to workspace/bin/."""
+    if install_type == 'plugin':
+        bin_dir = Path(clone_path) / 'plugin' / 'bin'
+        if not bin_dir.exists():
+            bin_dir = Path(clone_path) / 'bin'
+    else:
+        bin_dir = Path(clone_path) / 'bin'
+
+    if not bin_dir.exists():
+        return
+
+    for binary in bin_dir.iterdir():
+        if not binary.is_file():
+            continue
+        if not os.access(binary, os.X_OK):
+            continue
+        link = Path(WORKSPACE_BIN) / binary.name
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        link.symlink_to(binary.resolve())
+        _log(f"linked {binary.name} → workspace/bin/")
+
+def _remove_symlinks(clone_path):
+    """Remove workspace/bin symlinks that point into this clone."""
+    clone_resolved = str(Path(clone_path).resolve())
+    for link in Path(WORKSPACE_BIN).iterdir():
+        if link.is_symlink():
+            target = str(link.resolve())
+            if target.startswith(clone_resolved):
+                link.unlink()
+                _log(f"removed symlink: {link.name}")
+
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+def cmd_install(repo_spec):
+    _ensure_dirs()
+
+    repo_spec = repo_spec.strip().rstrip('/')
+    if repo_spec.startswith('https://github.com/'):
+        repo_spec = repo_spec[len('https://github.com/'):]
+    if repo_spec.endswith('.git'):
+        repo_spec = repo_spec[:-4]
+
+    if '/' not in repo_spec:
+        _err(f"expected owner/repo, got: {repo_spec}")
+        sys.exit(1)
+
+    repo_name  = repo_spec.split('/')[-1]
+    clone_path = f"{TMP_DIR}/{repo_name}"
+    reg        = _load_registry()
+
+    if os.path.exists(clone_path):
+        _log(f"{repo_name} already cloned — pulling latest before install")
+        _run(['git', '-C', clone_path, 'pull'])
+    else:
+        _log(f"cloning {repo_spec}...")
+        _run(['git', 'clone', f"https://github.com/{repo_spec}", clone_path])
+
+    install_type, install_path = _detect_type(clone_path)
+    if not install_type:
+        _err(f"cannot detect plugin or skill in {repo_name} — missing openclaw.plugin.json or SKILL.md")
+        sys.exit(1)
+
+    _log(f"detected {install_type}, installing...")
+    _openclaw_install(install_type, install_path)
+    _symlink_bins(clone_path, install_type)
+
+    now = _now()
+    reg[repo_name] = {
+        'repo':         repo_spec,
+        'type':         install_type,
+        'clone_path':   clone_path,
+        'install_path': install_path,
+        'installed_at': reg.get(repo_name, {}).get('installed_at', now),
+        'updated_at':   now,
+    }
+    _save_registry(reg)
+    _log(f"✓ {repo_name} installed ({install_type})")
+
+
+def cmd_update(repo_name):
+    reg = _load_registry()
+    if repo_name not in reg:
+        _err(f"{repo_name} not in registry — run: claw-gh-install <owner/{repo_name}>")
+        sys.exit(1)
+
+    entry      = reg[repo_name]
+    clone_path = entry['clone_path']
+
+    if not os.path.exists(clone_path):
+        _log(f"clone missing, re-cloning {entry['repo']}...")
+        _run(['git', 'clone', f"https://github.com/{entry['repo']}", clone_path])
+    else:
+        _log(f"pulling {repo_name}...")
+        _run(['git', '-C', clone_path, 'pull'])
+
+    install_type, install_path = _detect_type(clone_path)
+    _openclaw_install(install_type, install_path)
+    _symlink_bins(clone_path, install_type)
+
+    reg[repo_name]['updated_at'] = _now()
+    _save_registry(reg)
+    _log(f"✓ {repo_name} updated")
+
+
+def cmd_remove(repo_name):
+    reg        = _load_registry()
+    clone_path = f"{TMP_DIR}/{repo_name}"
+
+    _remove_symlinks(clone_path)
+
+    if os.path.exists(clone_path):
+        shutil.rmtree(clone_path)
+        _log(f"removed clone: {clone_path}")
+    else:
+        _log(f"no clone found at {clone_path}")
+
+    if repo_name in reg:
+        install_type = reg[repo_name].get('type')
+        del reg[repo_name]
+        _save_registry(reg)
+        _log(f"removed from registry")
+        _log(f"note: run 'openclaw {install_type}s uninstall {repo_name}' to remove from openclaw")
+    else:
+        _log(f"warning: {repo_name} not in registry")
+
+    _log(f"✓ {repo_name} removed")
+
+
+def cmd_list():
+    reg = _load_registry()
+    if not reg:
+        _log("no repos installed via claw-gh-install")
+        return
+    print(f"\n{'name':<30} {'type':<8} {'updated':<12} repo")
+    print("─" * 72)
+    for name, entry in sorted(reg.items()):
+        updated = entry.get('updated_at', '?')[:10]
+        print(f"{name:<30} {entry['type']:<8} {updated:<12} {entry['repo']}")
+    print()
+
+
+def cmd_show_config():
+    reg = _load_registry()
+    print(json.dumps({
+        'cgi_dir':        CGI_DIR,
+        'tmp_dir':        TMP_DIR,
+        'registry':       REGISTRY,
+        'workspace_bin':  WORKSPACE_BIN,
+        'registry_exists': os.path.exists(REGISTRY),
+        'installed':      {k: v['type'] for k, v in reg.items()},
+    }, indent=2))
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    args = sys.argv[1:]
+
+    if not args or args[0] in ('--help', '-h', 'help'):
+        print(__doc__)
+        sys.exit(0)
+
+    if args[0] == '--show-config':
+        cmd_show_config()
+    elif args[0] == '--list':
+        cmd_list()
+    elif args[0] == '--update':
+        if len(args) < 2:
+            _err("--update requires a repo name")
+            sys.exit(1)
+        cmd_update(args[1])
+    elif args[0] == '--remove':
+        if len(args) < 2:
+            _err("--remove requires a repo name")
+            sys.exit(1)
+        cmd_remove(args[1])
+    elif not args[0].startswith('--'):
+        cmd_install(args[0])
+    else:
+        _err(f"unknown command: {' '.join(args)}")
+        print("Run claw-gh-install --help for usage.", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
