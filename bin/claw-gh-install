@@ -122,7 +122,11 @@ def _openclaw_install(install_type, install_path):
     if install_type == 'plugin':
         _run(['openclaw', 'plugins', 'install', '--force', install_path])
     else:
-        _run(['openclaw', 'skills', 'install', install_path])
+        # --force was already passed on the plugin branch above but missing
+        # here -- any repeat install/update of an existing skill (exactly
+        # what cmd_update exists for) failed with "Skill already exists...
+        # Re-run with force/update." Found live re-testing the detection fix.
+        _run(['openclaw', 'skills', 'install', '--force', install_path])
 
 def _symlink_bins(clone_path, install_type):
     """Symlink executables from the tmp clone's bin/ to workspace/bin/."""
