@@ -7,12 +7,21 @@ via openclaw plugins install or openclaw skills install. Symlinks user-facing
 binaries to ~/.openclaw/workspace/bin/ for PATH access.
 
 Usage:
-  claw-gh-install <owner/repo>           Clone and install
-  claw-gh-install --update <repo-name>   git pull + reinstall
-  claw-gh-install --list                 List installed repos
-  claw-gh-install --remove <repo-name>   Remove install + tmp clone
-  claw-gh-install --show-config          Show paths and registry
-  claw-gh-install --help                 Show this help
+  claw-gh-install <owner/repo>                  Clone and install (defaults to skill)
+  claw-gh-install <owner/repo> --plugin-force   Install as a plugin even if SKILL.md exists
+  claw-gh-install --update <repo-name>          git pull + reinstall
+  claw-gh-install --list                        List installed repos
+  claw-gh-install --remove <repo-name>          Remove install + tmp clone
+  claw-gh-install --show-config                 Show paths and registry
+  claw-gh-install --help                        Show this help
+
+Plugin vs skill: a plugin loads real code into the openclaw gateway's own
+runtime (new tools/hooks/channels); a skill is just markdown + an optional
+CLI the agent drives through its existing exec tool. Skills are the safe
+default -- if SKILL.md is present, that's what gets installed, even if an
+openclaw.plugin.json also exists (a stale/leftover manifest file is not
+the same thing as a real plugin). A repo only installs as a plugin if it
+has a genuine HOOK.md AND --plugin-force was passed explicitly.
 """
 
 import sys, os, json, subprocess, shutil
@@ -58,14 +67,52 @@ def _err(msg):
 
 # ── Type detection ────────────────────────────────────────────────────────────
 
-def _detect_type(clone_path):
-    """Return ('plugin', install_path) or ('skill', install_path) or (None, None)."""
+def _detect_type(clone_path, plugin_force=False):
+    """Return ('plugin', install_path) or ('skill', install_path) or (None, None).
+
+    Skills are the safe default: no new code loads into the gateway, the
+    agent just drives an existing CLI through its exec tool. A plugin is a
+    real loaded module with hooks into the gateway's own runtime -- a repo
+    only installs as one if it has a genuine HOOK.md (not just a manifest
+    file claiming to be a plugin) AND the caller explicitly passed
+    --plugin-force. Found live: a repo with both SKILL.md and a stale,
+    no-HOOK.md openclaw.plugin.json kept getting misdetected as a plugin
+    and failing -- this is exactly the case that should default to skill.
+    """
+    plugin_dir = None
     if os.path.exists(f"{clone_path}/plugin/openclaw.plugin.json"):
-        return 'plugin', f"{clone_path}/plugin"
-    if os.path.exists(f"{clone_path}/openclaw.plugin.json"):
-        return 'plugin', clone_path
-    if os.path.exists(f"{clone_path}/SKILL.md"):
+        plugin_dir = f"{clone_path}/plugin"
+    elif os.path.exists(f"{clone_path}/openclaw.plugin.json"):
+        plugin_dir = clone_path
+
+    has_skill = os.path.exists(f"{clone_path}/SKILL.md")
+    has_hook = plugin_dir is not None and os.path.exists(f"{plugin_dir}/HOOK.md")
+
+    if has_skill and not plugin_force:
         return 'skill', clone_path
+
+    if plugin_force:
+        if not plugin_dir:
+            _err("--plugin-force given but no openclaw.plugin.json found")
+            sys.exit(1)
+        if not has_hook:
+            _err(f"openclaw.plugin.json present but no HOOK.md in {plugin_dir} -- "
+                 f"this doesn't look like a real plugin. Refusing even with --plugin-force.")
+            sys.exit(1)
+        return 'plugin', plugin_dir
+
+    # No --plugin-force, and no SKILL.md (handled above) -- only a plugin
+    # manifest, or nothing at all, is left to check.
+    if plugin_dir:
+        if has_hook:
+            _err(f"{os.path.basename(clone_path)} qualifies as a plugin "
+                 f"(openclaw.plugin.json + HOOK.md) but plugins aren't installed "
+                 f"by default. Re-run with: claw-gh-install <owner/repo> --plugin-force")
+        else:
+            _err("openclaw.plugin.json present but no HOOK.md -- doesn't look like "
+                 "a real plugin (stale manifest?). Not installing.")
+        sys.exit(1)
+
     return None, None
 
 
@@ -113,7 +160,7 @@ def _remove_symlinks(clone_path):
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
-def cmd_install(repo_spec):
+def cmd_install(repo_spec, plugin_force=False):
     _ensure_dirs()
 
     repo_spec = repo_spec.strip().rstrip('/')
@@ -137,7 +184,7 @@ def cmd_install(repo_spec):
         _log(f"cloning {repo_spec}...")
         _run(['git', 'clone', f"https://github.com/{repo_spec}", clone_path])
 
-    install_type, install_path = _detect_type(clone_path)
+    install_type, install_path = _detect_type(clone_path, plugin_force=plugin_force)
     if not install_type:
         _err(f"cannot detect plugin or skill in {repo_name} — missing openclaw.plugin.json or SKILL.md")
         sys.exit(1)
@@ -159,7 +206,7 @@ def cmd_install(repo_spec):
     _log(f"✓ {repo_name} installed ({install_type})")
 
 
-def cmd_update(repo_name):
+def cmd_update(repo_name, plugin_force=False):
     reg = _load_registry()
     if repo_name not in reg:
         _err(f"{repo_name} not in registry — run: claw-gh-install <owner/{repo_name}>")
@@ -175,7 +222,10 @@ def cmd_update(repo_name):
         _log(f"pulling {repo_name}...")
         _run(['git', '-C', clone_path, 'pull'])
 
-    install_type, install_path = _detect_type(clone_path)
+    install_type, install_path = _detect_type(clone_path, plugin_force=plugin_force)
+    if not install_type:
+        _err(f"cannot detect plugin or skill in {repo_name} — missing openclaw.plugin.json or SKILL.md")
+        sys.exit(1)
     _openclaw_install(install_type, install_path)
     _symlink_bins(clone_path, install_type)
 
@@ -242,6 +292,9 @@ def main():
         print(__doc__)
         sys.exit(0)
 
+    plugin_force = '--plugin-force' in args
+    args = [a for a in args if a != '--plugin-force']
+
     if args[0] == '--show-config':
         cmd_show_config()
     elif args[0] == '--list':
@@ -250,14 +303,14 @@ def main():
         if len(args) < 2:
             _err("--update requires a repo name")
             sys.exit(1)
-        cmd_update(args[1])
+        cmd_update(args[1], plugin_force=plugin_force)
     elif args[0] == '--remove':
         if len(args) < 2:
             _err("--remove requires a repo name")
             sys.exit(1)
         cmd_remove(args[1])
     elif not args[0].startswith('--'):
-        cmd_install(args[0])
+        cmd_install(args[0], plugin_force=plugin_force)
     else:
         _err(f"unknown command: {' '.join(args)}")
         print("Run claw-gh-install --help for usage.", file=sys.stderr)
